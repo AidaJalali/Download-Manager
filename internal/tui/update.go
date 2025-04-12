@@ -339,6 +339,9 @@ func handleError(m Model, msg ErrorMsg) (tea.Model, tea.Cmd) {
 
 // Handles periodic updates (e.g., checking for active downloads).
 func handleTick(m Model) (tea.Model, tea.Cmd) {
+	// Check network status
+	m.CheckNetworkStatus()
+
 	// Update active downloads
 	hasActive := false
 	for _, d := range m.Downloads {

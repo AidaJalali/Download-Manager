@@ -11,6 +11,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mahdiXak47/Download-Manager/internal/config"
 	"github.com/mahdiXak47/Download-Manager/internal/downloader"
+	"github.com/mahdiXak47/Download-Manager/internal/logger"
+	"github.com/mahdiXak47/Download-Manager/internal/network"
 	"github.com/mahdiXak47/Download-Manager/internal/queue"
 )
 
@@ -80,6 +82,8 @@ type Model struct {
 	PopupMessage string
 	PopupVisible bool
 	PopupType    string // "error", "success", "info"
+
+	NetworkMonitor *network.Monitor
 }
 
 // NewModel creates and initializes a new model
@@ -102,6 +106,10 @@ func NewModel() Model {
 	queueManager := queue.NewManager(cfg)
 	queueManager.Start()
 
+	// Initialize network monitor
+	networkMonitor := network.NewMonitor(2*time.Second, "google.com") // Check every 2 seconds
+	networkMonitor.Start()
+
 	return Model{
 		ActiveTab:          DownloadListTab,
 		Menu:               "list",
@@ -116,6 +124,7 @@ func NewModel() Model {
 		Width:              80,
 		Height:             24,
 		CurrentTheme:       "modern", // Default theme
+		NetworkMonitor:     networkMonitor,
 	}
 }
 
@@ -475,7 +484,8 @@ func (m *Model) RetryDownload() {
 				if err != nil {
 					m.ShowPopup(fmt.Sprintf("Error: %s", err.Error()), "error")
 				} else {
-					m.ShowPopup(fmt.Sprintf("Trying again to download file #%d", m.Selected+1), "success")
+					m.ShowPopup(fmt.Sprintf("Trying again to download file #%d (attempt %d of 3)",
+						m.Selected+1, download.GetRetryCount()), "success")
 
 					// Queue the download for processing
 					m.QueueManager.ProcessDownload(download.URL)
@@ -490,10 +500,42 @@ func (m *Model) RetryDownload() {
 			} else {
 				// Max retries reached
 				m.ShowPopup("Error: Maximum retry attempts (3) reached for this download", "error")
+				// Reset retry count for future attempts
+				download.ResetRetryCount()
 			}
 		} else {
 			// Not in error state
 			m.ShowPopup("Error: Only downloads in error state can be retried", "error")
+		}
+	}
+}
+
+// CheckNetworkStatus checks if the network is connected and updates the UI accordingly
+func (m *Model) CheckNetworkStatus() {
+	if m.NetworkMonitor == nil {
+		logger.LogDownloadEvent("NETWORK", "Network monitor is nil")
+		return
+	}
+
+	isConnected := m.NetworkMonitor.IsConnected()
+	logger.LogDownloadEvent("NETWORK", fmt.Sprintf("Network status check: connected=%v", isConnected))
+
+	if !isConnected {
+		m.ShowPopup("Network connection lost. Downloads may be paused.", "error")
+		// Pause all active downloads when network is lost
+		for i := range m.Downloads {
+			if m.Downloads[i].Status == "downloading" {
+				logger.LogDownloadEvent("NETWORK", fmt.Sprintf("Pausing download due to network loss: %s", m.Downloads[i].URL))
+				m.QueueManager.PauseDownload(m.Downloads[i].URL)
+			}
+		}
+	} else {
+		// Resume paused downloads when network is restored
+		for i := range m.Downloads {
+			if m.Downloads[i].Status == "paused" {
+				logger.LogDownloadEvent("NETWORK", fmt.Sprintf("Resuming download after network restore: %s", m.Downloads[i].URL))
+				m.QueueManager.ResumeDownload(m.Downloads[i].URL)
+			}
 		}
 	}
 }

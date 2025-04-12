@@ -102,36 +102,46 @@ func (d *Download) Initialize() {
 // Pause signals the download to pause
 func (d *Download) Pause() {
 	d.mutex.Lock()
-	oldStatus := d.Status
 	defer d.mutex.Unlock()
 
+	// Only allow pausing if we're actually downloading and not already paused
 	if d.Status == "downloading" && !d.isPaused && !d.isCancelled {
+		oldStatus := d.Status
 		d.Status = "paused"
 		d.isPaused = true
 		// Log status change to paused
 		logger.LogDownloadStatus(d.URL, oldStatus, d.Status, d.Downloaded, d.TotalSize)
+		// Send pause signal
 		select {
 		case d.pauseChan <- struct{}{}:
 		default:
 		}
+	} else {
+		logger.LogDownloadError(d.URL, d.Queue, fmt.Sprintf("Cannot pause: status=%s, isPaused=%v, isCancelled=%v",
+			d.Status, d.isPaused, d.isCancelled))
 	}
 }
 
 // Resume signals the download to resume
 func (d *Download) Resume() {
 	d.mutex.Lock()
-	oldStatus := d.Status
 	defer d.mutex.Unlock()
 
+	// Only allow resuming if we're actually paused
 	if d.Status == "paused" && d.isPaused && !d.isCancelled {
+		oldStatus := d.Status
 		d.Status = "downloading"
 		d.isPaused = false
 		// Log status change to downloading (resumed)
 		logger.LogDownloadStatus(d.URL, oldStatus, d.Status, d.Downloaded, d.TotalSize)
+		// Send resume signal
 		select {
 		case d.resumeChan <- struct{}{}:
 		default:
 		}
+	} else {
+		logger.LogDownloadError(d.URL, d.Queue, fmt.Sprintf("Cannot resume: status=%s, isPaused=%v, isCancelled=%v",
+			d.Status, d.isPaused, d.isCancelled))
 	}
 }
 
@@ -176,12 +186,16 @@ func (d *Download) Retry() error {
 		d.Speed = 0
 		d.Downloaded = 0
 		d.RetryCount++
-		// Log status change to pending (retry)
-		logger.LogDownloadPending(d.URL, d.Queue, fmt.Sprintf("Retry attempt %d of %d", d.RetryCount, d.MaxRetries))
-		// Log the status change
+
+		// Log the retry attempt
+		logger.LogDownloadEvent("RETRY", fmt.Sprintf("Retry attempt %d of %d for download %s", d.RetryCount, d.MaxRetries, d.URL))
+
+		// Log status change
 		logger.LogDownloadStatus(d.URL, oldStatus, d.Status, 0, d.TotalSize)
 		return nil
 	}
+
+	logger.LogDownloadError(d.URL, d.Queue, fmt.Sprintf("Cannot retry download: invalid status %s", d.Status))
 	return fmt.Errorf("download is not in error state")
 }
 
@@ -211,6 +225,14 @@ func (d *Download) GetRetryCount() int {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 	return d.RetryCount
+}
+
+// ResetRetryCount resets the retry count for a download
+func (d *Download) ResetRetryCount() {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	d.RetryCount = 0
+	logger.LogDownloadEvent("RETRY", fmt.Sprintf("Reset retry count for download %s", d.URL))
 }
 
 // Start begins downloading a file with optional progress callback
@@ -479,12 +501,24 @@ func (d *Download) downloadChunks(body io.Reader, file *os.File, startByte, tota
 		select {
 		case <-d.pauseChan:
 			logger.LogDownloadStatus(d.URL, "downloading", "paused", downloaded, totalSize)
-			<-d.resumeChan
-			startTime = time.Now()
-			lastUpdateTime = startTime
-			lastBytes = downloaded
-			logger.LogDownloadStatus(d.URL, "paused", "downloading", downloaded, totalSize)
-			continue
+			// Wait for resume signal
+			select {
+			case <-d.resumeChan:
+				logger.LogDownloadStatus(d.URL, "paused", "downloading", downloaded, totalSize)
+				startTime = time.Now()
+				lastUpdateTime = startTime
+				lastBytes = downloaded
+				continue
+			case <-d.cancelChan:
+				logger.LogDownloadStatus(d.URL, "paused", "cancelled", downloaded, totalSize)
+				return DownloadResult{
+					Completed:   false,
+					Downloaded:  downloaded,
+					TotalSize:   totalSize,
+					Error:       fmt.Errorf("download cancelled"),
+					ShouldRetry: false,
+				}
+			}
 
 		case <-d.cancelChan:
 			logger.LogDownloadStatus(d.URL, "downloading", "cancelled", downloaded, totalSize)

@@ -71,15 +71,23 @@ func (m *Manager) PauseDownload(url string) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if d, exists := m.downloads[url]; exists && d.Status == "downloading" {
-		logger.LogDownloadEvent("QUEUE", fmt.Sprintf("Pausing download %s in queue %s", url, d.Queue))
-		d.Pause()
-		m.activeJobs[d.Queue]--
+	if d, exists := m.downloads[url]; exists {
+		logger.LogDownloadEvent("QUEUE", fmt.Sprintf("Attempting to pause download %s in queue %s (current status: %s)", url, d.Queue, d.Status))
 
-		// Save state
-		if err := config.SaveConfig(m.config); err != nil {
-			logger.LogDownloadError(url, d.Queue, fmt.Sprintf("Failed to save config when pausing: %v", err))
+		if d.Status == "downloading" {
+			d.Pause()
+			m.activeJobs[d.Queue]--
+			logger.LogDownloadEvent("QUEUE", fmt.Sprintf("Successfully paused download %s in queue %s", url, d.Queue))
+
+			// Save state
+			if err := config.SaveConfig(m.config); err != nil {
+				logger.LogDownloadError(url, d.Queue, fmt.Sprintf("Failed to save config when pausing: %v", err))
+			}
+		} else {
+			logger.LogDownloadError(url, d.Queue, fmt.Sprintf("Cannot pause download: invalid status %s", d.Status))
 		}
+	} else {
+		logger.LogDownloadError(url, "", "Cannot pause download: download not found")
 	}
 }
 
@@ -88,35 +96,43 @@ func (m *Manager) ResumeDownload(url string) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if d, exists := m.downloads[url]; exists && d.Status == "paused" {
-		// Check if we can resume based on queue limits
-		queueCfg := m.config.GetQueue(d.Queue)
-		if queueCfg == nil {
-			logger.LogDownloadError(url, d.Queue, "Cannot resume: queue configuration not found")
-			return
-		}
+	if d, exists := m.downloads[url]; exists {
+		logger.LogDownloadEvent("QUEUE", fmt.Sprintf("Attempting to resume download %s in queue %s (current status: %s)", url, d.Queue, d.Status))
 
-		if !queueCfg.IsTimeAllowed() {
-			logger.LogDownloadPending(url, d.Queue, fmt.Sprintf("Cannot resume: outside allowed time window (%s-%s)",
-				queueCfg.StartTime, queueCfg.EndTime))
-			return
-		}
+		if d.Status == "paused" {
+			// Check if we can resume based on queue limits
+			queueCfg := m.config.GetQueue(d.Queue)
+			if queueCfg == nil {
+				logger.LogDownloadError(url, d.Queue, "Cannot resume: queue configuration not found")
+				return
+			}
 
-		if m.activeJobs[d.Queue] >= queueCfg.MaxConcurrent {
-			logger.LogDownloadPending(url, d.Queue, fmt.Sprintf("Cannot resume: queue at maximum capacity (%d downloads)",
-				queueCfg.MaxConcurrent))
-			return
-		}
+			if !queueCfg.IsTimeAllowed() {
+				logger.LogDownloadPending(url, d.Queue, fmt.Sprintf("Cannot resume: outside allowed time window (%s-%s)",
+					queueCfg.StartTime, queueCfg.EndTime))
+				return
+			}
 
-		// Resume the download
-		logger.LogDownloadEvent("QUEUE", fmt.Sprintf("Resuming download %s in queue %s", url, d.Queue))
-		d.Resume()
-		m.activeJobs[d.Queue]++
+			if m.activeJobs[d.Queue] >= queueCfg.MaxConcurrent {
+				logger.LogDownloadPending(url, d.Queue, fmt.Sprintf("Cannot resume: queue at maximum capacity (%d downloads)",
+					queueCfg.MaxConcurrent))
+				return
+			}
 
-		// Save state
-		if err := config.SaveConfig(m.config); err != nil {
-			logger.LogDownloadError(url, d.Queue, fmt.Sprintf("Failed to save config when resuming: %v", err))
+			// Resume the download
+			d.Resume()
+			m.activeJobs[d.Queue]++
+			logger.LogDownloadEvent("QUEUE", fmt.Sprintf("Successfully resumed download %s in queue %s", url, d.Queue))
+
+			// Save state
+			if err := config.SaveConfig(m.config); err != nil {
+				logger.LogDownloadError(url, d.Queue, fmt.Sprintf("Failed to save config when resuming: %v", err))
+			}
+		} else {
+			logger.LogDownloadError(url, d.Queue, fmt.Sprintf("Cannot resume download: invalid status %s", d.Status))
 		}
+	} else {
+		logger.LogDownloadError(url, "", "Cannot resume download: download not found")
 	}
 }
 
