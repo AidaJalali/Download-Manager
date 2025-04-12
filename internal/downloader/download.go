@@ -31,16 +31,17 @@ type Download struct {
 	ScheduledStartTime time.Time `json:"scheduled_start_time,omitempty"`
 
 	// Control fields (not persisted to JSON)
-	pauseChan   chan struct{} `json:"-"`
-	resumeChan  chan struct{} `json:"-"`
-	cancelChan  chan struct{} `json:"-"`
-	isPaused    bool          `json:"-"`
-	isCancelled bool          `json:"-"`
-	mutex       sync.Mutex    `json:"-"`
-	retryCount  int           `json:"retry_count"`
-	maxRetries  int           `json:"max_retries"`
-	retryDelay  time.Duration `json:"-"`
-	client      *http.Client  `json:"-"`
+	pauseChan      chan struct{} `json:"-"`
+	resumeChan     chan struct{} `json:"-"`
+	cancelChan     chan struct{} `json:"-"`
+	isPaused       bool          `json:"-"`
+	isCancelled    bool          `json:"-"`
+	mutex          sync.Mutex    `json:"-"`
+	RetryCount     int           `json:"retry_count"`
+	MaxRetries     int           `json:"max_retries"`
+	RetryDelay     time.Duration `json:"-"`
+	client         *http.Client  `json:"-"`
+	supportsRanges bool          `json:"-"`
 }
 
 // DownloadResult represents the outcome of a download attempt
@@ -70,11 +71,11 @@ func (d *Download) Initialize() {
 		d.Status = "pending"
 		logger.LogDownloadPending(d.URL, d.Queue, "Initialized download")
 	}
-	if d.maxRetries == 0 {
-		d.maxRetries = 3
+	if d.MaxRetries == 0 {
+		d.MaxRetries = 3
 	}
-	if d.retryDelay == 0 {
-		d.retryDelay = 5 * time.Second
+	if d.RetryDelay == 0 {
+		d.RetryDelay = 5 * time.Second
 	}
 	if d.client == nil {
 		// Configure HTTP client with more lenient timeouts
@@ -174,9 +175,9 @@ func (d *Download) Retry() error {
 		d.Progress = 0
 		d.Speed = 0
 		d.Downloaded = 0
-		d.retryCount++
+		d.RetryCount++
 		// Log status change to pending (retry)
-		logger.LogDownloadPending(d.URL, d.Queue, fmt.Sprintf("Retry attempt %d of %d", d.retryCount, d.maxRetries))
+		logger.LogDownloadPending(d.URL, d.Queue, fmt.Sprintf("Retry attempt %d of %d", d.RetryCount, d.MaxRetries))
 		// Log the status change
 		logger.LogDownloadStatus(d.URL, oldStatus, d.Status, 0, d.TotalSize)
 		return nil
@@ -209,7 +210,7 @@ func (d *Download) GetSpeed() int64 {
 func (d *Download) GetRetryCount() int {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	return d.retryCount
+	return d.RetryCount
 }
 
 // Start begins downloading a file with optional progress callback
@@ -234,7 +235,7 @@ func (d *Download) Start() error {
 	}
 
 	// Main download loop with retry logic
-	for d.retryCount <= d.maxRetries {
+	for d.RetryCount <= d.MaxRetries {
 		err := d.performDownload()
 		if err == nil {
 			// Download completed successfully
@@ -272,25 +273,25 @@ func (d *Download) Start() error {
 		logger.LogDownloadStatus(d.URL, oldStatus, "error", d.Downloaded, d.TotalSize)
 
 		// Check if we should retry
-		if d.retryCount < d.maxRetries {
-			d.retryCount++
+		if d.RetryCount < d.MaxRetries {
+			d.RetryCount++
 			d.Status = "pending"
 			retryMsg := fmt.Sprintf("Retry attempt %d of %d after error: %s",
-				d.retryCount, d.maxRetries, err.Error())
+				d.RetryCount, d.MaxRetries, err.Error())
 			logger.LogDownloadPending(d.URL, d.Queue, retryMsg)
 			logger.LogDownloadStatus(d.URL, "error", "pending", d.Downloaded, d.TotalSize)
 			d.mutex.Unlock()
-			time.Sleep(d.retryDelay)
+			time.Sleep(d.RetryDelay)
 			continue
 		}
 
 		d.mutex.Unlock()
-		finalError := fmt.Errorf("download failed after %d retries: %v", d.maxRetries, err)
+		finalError := fmt.Errorf("download failed after %d retries: %v", d.MaxRetries, err)
 		logger.LogDownloadError(d.URL, d.Queue, finalError.Error())
 		return finalError
 	}
 
-	finalError := fmt.Errorf("download failed after %d retries", d.maxRetries)
+	finalError := fmt.Errorf("download failed after %d retries", d.MaxRetries)
 	logger.LogDownloadError(d.URL, d.Queue, finalError.Error())
 	return finalError
 }
@@ -305,23 +306,19 @@ func (d *Download) performDownload() error {
 		d.Queue = "default"
 	}
 
-	// Create directory if it doesn't exist
-	dir := filepath.Dir(d.TargetPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		errorMsg := fmt.Sprintf("failed to create directory: %v", err)
-		logger.LogDownloadError(d.URL, d.Queue, errorMsg)
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
 	// Try HEAD request first, but don't fail if it doesn't work
 	var totalSize int64
 	var supportsRanges bool
+	var headResp *http.Response
 
-	resp, err := d.client.Head(d.URL)
-	if err == nil {
-		defer resp.Body.Close()
-		totalSize, _ = strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
-		supportsRanges = resp.Header.Get("Accept-Ranges") == "bytes"
+	headResp, err := d.client.Head(d.URL)
+	if err != nil {
+		// Log the HEAD request failure but don't return error yet
+		logger.LogDownloadError(d.URL, d.Queue, fmt.Sprintf("HEAD request failed: %v, proceeding with GET request", err))
+	} else {
+		defer headResp.Body.Close()
+		totalSize, _ = strconv.ParseInt(headResp.Header.Get("Content-Length"), 10, 64)
+		supportsRanges = headResp.Header.Get("Accept-Ranges") == "bytes"
 	}
 
 	// Create the GET request
@@ -332,17 +329,35 @@ func (d *Download) performDownload() error {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// Add some common headers to help with compatibility
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
 	// If we're resuming and we know the server supports ranges, set the range header
 	d.mutex.Lock()
 	startByte := d.Downloaded
+	d.supportsRanges = supportsRanges
 	d.mutex.Unlock()
 
 	if startByte > 0 && supportsRanges {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startByte))
 	}
 
-	// Send the request
-	resp, err = d.client.Do(req)
+	// Send the request with retry logic
+	var getResp *http.Response
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		getResp, err = d.client.Do(req)
+		if err == nil {
+			break
+		}
+		if i < maxRetries-1 {
+			logger.LogDownloadError(d.URL, d.Queue, fmt.Sprintf("GET request attempt %d failed: %v, retrying...", i+1, err))
+			time.Sleep(time.Second * time.Duration(i+1)) // Exponential backoff
+		}
+	}
+
 	if err != nil {
 		// Check for network-related errors
 		if os.IsTimeout(err) || err == io.ErrUnexpectedEOF || err == io.EOF {
@@ -354,29 +369,30 @@ func (d *Download) performDownload() error {
 			return fmt.Errorf("download paused due to network error: %w", err)
 		}
 
-		errorMsg := fmt.Sprintf("failed to send GET request: %v", err)
+		errorMsg := fmt.Sprintf("failed to send GET request after %d attempts: %v", maxRetries, err)
 		logger.LogDownloadError(d.URL, d.Queue, errorMsg)
 		return fmt.Errorf("failed to send GET request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer getResp.Body.Close()
 
 	// Check if the request was successful
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errorMsg := fmt.Sprintf("server responded with status: %s", resp.Status)
+	if getResp.StatusCode < 200 || getResp.StatusCode >= 300 {
+		errorMsg := fmt.Sprintf("server responded with status: %s", getResp.Status)
 		logger.LogDownloadError(d.URL, d.Queue, errorMsg)
-		return fmt.Errorf("server responded with status: %s", resp.Status)
+		return fmt.Errorf("server responded with status: %s", getResp.Status)
 	}
 
 	// Update total size from GET response if we didn't get it from HEAD
 	if totalSize == 0 {
-		totalSize, _ = strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+		totalSize, _ = strconv.ParseInt(getResp.Header.Get("Content-Length"), 10, 64)
 		d.mutex.Lock()
 		d.TotalSize = totalSize
+		d.supportsRanges = getResp.Header.Get("Accept-Ranges") == "bytes"
 		d.mutex.Unlock()
 	}
 
 	// If we got a 206 response, the server supports ranges
-	if resp.StatusCode == 206 {
+	if getResp.StatusCode == 206 {
 		supportsRanges = true
 	}
 
@@ -391,6 +407,21 @@ func (d *Download) performDownload() error {
 		startByte = 0
 	}
 
+	// Verify target directory exists and is writable
+	dir := filepath.Dir(d.TargetPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		errorMsg := fmt.Sprintf("failed to create directory: %v", err)
+		logger.LogDownloadError(d.URL, d.Queue, errorMsg)
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// Check if we can write to the target directory
+	if err := os.Chmod(dir, 0755); err != nil {
+		errorMsg := fmt.Sprintf("target directory is not writable: %v", err)
+		logger.LogDownloadError(d.URL, d.Queue, errorMsg)
+		return fmt.Errorf("target directory is not writable: %w", err)
+	}
+
 	file, err = os.OpenFile(d.TargetPath, openMode, 0644)
 	if err != nil {
 		errorMsg := fmt.Sprintf("failed to open file: %v", err)
@@ -399,7 +430,7 @@ func (d *Download) performDownload() error {
 	}
 	defer file.Close()
 
-	result := d.downloadChunks(resp.Body, file, startByte, totalSize)
+	result := d.downloadChunks(getResp.Body, file, startByte, totalSize)
 
 	if result.Error != nil && !result.ShouldRetry {
 		return result.Error
@@ -522,10 +553,13 @@ func (d *Download) downloadChunks(body io.Reader, file *os.File, startByte, tota
 			d.Speed = bytesPerSecond
 			d.mutex.Unlock()
 
-			progressPercent := float64(downloaded) / float64(totalSize) * 100
-			lastProgressPercent := float64(lastBytes) / float64(totalSize) * 100
-			if (int(progressPercent/10) > int(lastProgressPercent/10)) || elapsed >= 30*time.Second {
-				logger.LogDownloadStatus(d.URL, "downloading", "downloading", downloaded, totalSize)
+			// Only calculate progress if we have a valid total size
+			if totalSize > 0 {
+				progressPercent := float64(downloaded) / float64(totalSize) * 100
+				lastProgressPercent := float64(lastBytes) / float64(totalSize) * 100
+				if (int(progressPercent/10) > int(lastProgressPercent/10)) || elapsed >= 30*time.Second {
+					logger.LogDownloadStatus(d.URL, "downloading", "downloading", downloaded, totalSize)
+				}
 			}
 
 			lastUpdateTime = now
@@ -551,8 +585,8 @@ func New(url, targetPath, queue string, maxBandwidth int64, scheduledStartTime t
 		Queue:              queue,
 		Status:             "pending",
 		MaxBandwidth:       maxBandwidth,
-		maxRetries:         3,
-		retryDelay:         5 * time.Second,
+		MaxRetries:         3,
+		RetryDelay:         5 * time.Second,
 		ScheduledStartTime: scheduledStartTime,
 	}
 	download.Initialize()

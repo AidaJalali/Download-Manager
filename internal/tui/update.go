@@ -164,6 +164,10 @@ func handleKeyPress(m Model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case tea.KeyEsc:
 		// ESC in base mode clears messages and resets state
+		if m.PopupVisible {
+			m.HidePopup()
+			return m, nil
+		}
 		if m.ActiveTab == AddDownloadTab && m.AddDownloadMessage != "" {
 			// Clear any download messages
 			m.AddDownloadMessage = ""
@@ -399,11 +403,12 @@ func handleDownloadListTab(m Model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "p":
 		m.PauseDownload()
-	case "s":
+	case "r":
 		m.ResumeDownload()
+		return m, tickCmd()
 	case "c":
 		m.CancelDownload()
-	case "r":
+	case "y":
 		// Retry the selected download if it's in error state
 		m.RetryDownload()
 	case "a":

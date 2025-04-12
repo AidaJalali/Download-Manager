@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mahdiXak47/Download-Manager/internal/tui/styles"
 )
 
 func (m Model) View() string {
@@ -40,6 +41,39 @@ func (m Model) View() string {
 	// Tab bar at the bottom
 	tabBar := renderTabBar(m)
 	content.WriteString("\n" + tabBar)
+
+	// Add popup message if visible
+	if m.PopupVisible {
+		var popupStyle lipgloss.Style
+		switch m.PopupType {
+		case "error":
+			popupStyle = styles.ErrorStyle
+		case "success":
+			popupStyle = styles.SuccessStyle
+		case "info":
+			popupStyle = styles.InfoStyle
+		default:
+			popupStyle = styles.InfoStyle
+		}
+
+		// Add help text to the popup message
+		popupContent := fmt.Sprintf("%s\n\nPress ESC to close", m.PopupMessage)
+		popup := popupStyle.
+			Width(50).
+			Align(lipgloss.Center).
+			Padding(1, 2).
+			Render(popupContent)
+
+		// Center the popup
+		popup = lipgloss.Place(
+			m.Width, m.Height,
+			lipgloss.Center, lipgloss.Center,
+			popup,
+		)
+
+		// Overlay the popup on top of the main content
+		content.WriteString("\n" + popup)
+	}
 
 	// Wrap everything in the main container
 	return mainContainer.Render(content.String())
@@ -264,7 +298,7 @@ func renderDownloadListTab(m Model) string {
 	}
 
 	// Help text
-	s.WriteString("\n" + helpStyle.Width(m.Width).Render("[ ↑/↓ ] Navigate   [ p ] Pause   [ r ] Resume   [ d ] Delete   [ y ] Retry"))
+	s.WriteString("\n" + helpStyle.Width(m.Width).Render("[ ↑/↓ ] Navigate   [ p ] Pause   [ r ] Resume   [ c ] Cancel   [ y ] Retry   [ d ] Delete"))
 
 	return s.String()
 }

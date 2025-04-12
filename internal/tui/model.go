@@ -76,6 +76,10 @@ type Model struct {
 	// Add fields to track download start and completion times
 	StartTime      time.Time
 	CompletionTime time.Time
+
+	PopupMessage string
+	PopupVisible bool
+	PopupType    string // "error", "success", "info"
 }
 
 // NewModel creates and initializes a new model
@@ -279,6 +283,9 @@ func (m *Model) PauseDownload() {
 			// Set completion time to zero if paused
 			download.CompletionTime = time.Time{}
 			m.QueueManager.PauseDownload(download.URL)
+			m.ShowPopup(fmt.Sprintf("Paused download: %s", download.Filename), "info")
+		} else {
+			m.ShowPopup("Can only pause downloads that are in progress", "error")
 		}
 	}
 }
@@ -291,6 +298,9 @@ func (m *Model) ResumeDownload() {
 			// Reset start time when resuming
 			download.StartTime = time.Now()
 			m.QueueManager.ResumeDownload(download.URL)
+			m.ShowPopup(fmt.Sprintf("Resumed download: %s", download.Filename), "info")
+		} else {
+			m.ShowPopup("Can only resume downloads that are paused", "error")
 		}
 	}
 }
@@ -437,6 +447,20 @@ func (m *Model) SaveQueueForm() error {
 	return config.SaveConfig(m.Config)
 }
 
+// ShowPopup shows a popup message
+func (m *Model) ShowPopup(message string, popupType string) {
+	m.PopupMessage = message
+	m.PopupVisible = true
+	m.PopupType = popupType
+}
+
+// HidePopup hides the popup message
+func (m *Model) HidePopup() {
+	m.PopupVisible = false
+	m.PopupMessage = ""
+	m.PopupType = ""
+}
+
 // RetryDownload retries the selected download if it's in error state
 func (m *Model) RetryDownload() {
 	if m.Selected >= 0 && m.Selected < len(m.Downloads) {
@@ -449,11 +473,9 @@ func (m *Model) RetryDownload() {
 				// Retry the download
 				err := download.Retry()
 				if err != nil {
-					m.DownloadListMessage = fmt.Sprintf("Error: %s", err.Error())
-					m.DownloadListSuccess = false
+					m.ShowPopup(fmt.Sprintf("Error: %s", err.Error()), "error")
 				} else {
-					m.DownloadListMessage = fmt.Sprintf("Trying again to download file #%d", m.Selected+1)
-					m.DownloadListSuccess = true
+					m.ShowPopup(fmt.Sprintf("Trying again to download file #%d", m.Selected+1), "success")
 
 					// Queue the download for processing
 					m.QueueManager.ProcessDownload(download.URL)
@@ -461,19 +483,17 @@ func (m *Model) RetryDownload() {
 					// Update config
 					if m.Config != nil {
 						if err := config.SaveConfig(m.Config); err != nil {
-							m.ErrorMessage = "Failed to save config: " + err.Error()
+							m.ShowPopup(fmt.Sprintf("Failed to save config: %s", err.Error()), "error")
 						}
 					}
 				}
 			} else {
 				// Max retries reached
-				m.DownloadListMessage = "Error: Maximum retry attempts (3) reached for this download"
-				m.DownloadListSuccess = false
+				m.ShowPopup("Error: Maximum retry attempts (3) reached for this download", "error")
 			}
 		} else {
 			// Not in error state
-			m.DownloadListMessage = "Error: Only downloads in error state can be retried"
-			m.DownloadListSuccess = false
+			m.ShowPopup("Error: Only downloads in error state can be retried", "error")
 		}
 	}
 }
